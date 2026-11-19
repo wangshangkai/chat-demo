@@ -10,6 +10,8 @@ declare const styles: {
   readonly "text": string;
   readonly "label": string;
   readonly "uploadButton": string;
+  readonly "syncInputs": string;
+  readonly "syncField": string;
   readonly "locationCell": string;
   readonly "locationSelectors": string;
   readonly "provinceSelect": string;

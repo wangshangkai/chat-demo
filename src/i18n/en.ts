@@ -127,7 +127,26 @@ export const en = {
   exportAllLabel: 'Export all chats',
   historyExportDescription:
     'Includes all chat history and locally stored images. Other attachments retain file details only. Your API Key is not included.',
+  exportRecentLabel: 'Export chats from the last 3 days',
+  exportRecentDescription:
+    'Includes sessions updated in the last 72 hours and locally stored images. Your API Key is not included.',
   exportAllDownload: 'Download',
+  syncHistory: 'Sync chats from the last 3 days',
+  syncHistoryDescription:
+    'Downloads and merges cloud chats, then uploads local chats from the last 3 days.',
+  syncServerUrl: 'Server URL',
+  syncServerUrlPlaceholder: 'https://example.com',
+  syncFileId: 'File ID',
+  syncFileIdPlaceholder: 'sync_001',
+  syncNow: 'Sync',
+  syncing: 'Syncing...',
+  syncHistoryInvalidConfig: 'Enter a valid server URL and file ID.',
+  syncHistoryNothing: 'No cloud file found, and there are no chats from the last 3 days.',
+  syncHistoryDone:
+    'Sync complete: {inserted} added, {updated} updated, {kept} newer local kept, {exported} chats uploaded.',
+  syncHistoryFailed: 'Sync failed. Check the server URL, network, and file format.',
+  syncHistoryUploadFailed:
+    'Cloud data was merged, but uploading {count} chats failed. Please try again later.',
   deleteAllSessions: 'Delete all chats',
   deleteAllSessionsModalTitle: 'Once deleted, all chats will be cleared and cannot be recovered.',
   deleteAllSessionsModalDescription:

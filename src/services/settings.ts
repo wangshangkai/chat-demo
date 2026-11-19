@@ -7,7 +7,7 @@ export type Locale = 'zh-CN' | 'en-US'
 /** 主题偏好；默认跟随系统 */
 export type ThemePreference = 'light' | 'dark' | 'system'
 
-/** 本机设置，存 localStorage：API Key、语言、主题、位置、朗读音色、深度思考与智能搜索开关、侧边栏收起状态 */
+/** 本机设置，存 localStorage：API Key、语言、主题、位置、朗读音色、深度思考与智能搜索开关、侧边栏收起状态、历史同步配置 */
 type Settings = {
   apiKey: string | null
   locale: Locale
@@ -17,6 +17,8 @@ type Settings = {
   thinking: boolean
   search: boolean
   siderCollapsed: boolean
+  syncServerUrl: string
+  syncFileId: string
 }
 
 const KEYS = {
@@ -28,6 +30,8 @@ const KEYS = {
   thinking: 'chat-demo:thinking',
   search: 'chat-demo:search',
   siderCollapsed: 'chat-demo:sider-collapsed',
+  syncServerUrl: 'chat-demo:sync-server-url',
+  syncFileId: 'chat-demo:sync-file-id',
 } as const
 
 const read = (key: string) => {
@@ -96,6 +100,8 @@ export const useSettings = create<Settings>(() => ({
   thinking: read(KEYS.thinking) === 'true',
   search: read(KEYS.search) === 'true',
   siderCollapsed: read(KEYS.siderCollapsed) === 'true',
+  syncServerUrl: read(KEYS.syncServerUrl) ?? '',
+  syncFileId: read(KEYS.syncFileId) ?? '',
 }))
 
 export const setLocale = (locale: Locale) => {
@@ -137,4 +143,14 @@ export const setSearch = (search: boolean) => {
 export const setSiderCollapsed = (siderCollapsed: boolean) => {
   write(KEYS.siderCollapsed, String(siderCollapsed))
   useSettings.setState({ siderCollapsed })
+}
+
+export const setSyncServerUrl = (syncServerUrl: string) => {
+  write(KEYS.syncServerUrl, syncServerUrl)
+  useSettings.setState({ syncServerUrl })
+}
+
+export const setSyncFileId = (syncFileId: string) => {
+  write(KEYS.syncFileId, syncFileId)
+  useSettings.setState({ syncFileId })
 }

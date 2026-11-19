@@ -14,6 +14,9 @@ import {
   clearHistory,
   exportHistory,
   importHistory,
+  RECENT_HISTORY_HOURS,
+  syncHistory,
+  SyncUploadError,
 } from '../../services/chat/backup.js'
 import { useIsMobile } from '../../app/viewport.js'
 import { useChatStore } from '../../services/chat/store.js'
@@ -22,11 +25,14 @@ import {
   isChineseBrowser,
   setLocale,
   setLocation,
+  setSyncFileId,
+  setSyncServerUrl,
   setThemePreference,
   setTtsVoice,
   useSettings,
   type ThemePreference,
 } from '../../services/settings.js'
+import { isValidSyncFileId, isValidSyncServerUrl } from '../../services/sync/remote.js'
 import { useTranslate, type TranslationKey, type TranslationMessage } from '../../i18n/index.js'
 import { Button } from '../base/Button.js'
 import { Modal } from '../base/Modal.js'
@@ -62,9 +68,10 @@ const SettingsContent = () => {
   // 切换分组不丢失正在输入的 API Key 与导入状态
   const apiKeyEditor = useApiKeyEditor()
   const historyImport = useHistoryImport()
+  const sync = useSyncHistory()
   const historyDelete = useHistoryDelete()
   const replacingHistory = useChatStore((state) => state.importingHistory)
-  const historyBusy = historyImport.busy || historyDelete.busy || replacingHistory
+  const historyBusy = historyImport.busy || sync.busy || historyDelete.busy || replacingHistory
   return (
     <>
       <Modal
@@ -106,6 +113,8 @@ const SettingsContent = () => {
               <ApiKeyField editor={apiKeyEditor} />
               <ImportHistory historyImport={historyImport} disabled={historyBusy} />
               <ExportHistory disabled={historyBusy} />
+              <ExportRecentHistory disabled={historyBusy} />
+              <SyncHistory sync={sync} disabled={historyBusy} />
               <SettingCell
                 label={t('deleteAllSessions')}
                 status={null}
@@ -522,6 +531,15 @@ const ImportHistory = ({
   )
 }
 
+const downloadBlob = (name: string, blob: Blob) => {
+  const url = URL.createObjectURL(blob)
+  const link = document.createElement('a')
+  link.href = url
+  link.download = name
+  link.click()
+  setTimeout(() => URL.revokeObjectURL(url), 10_000)
+}
+
 /** 将全部会话及图片导出为 ZIP 文件并下载 */
 const ExportHistory = ({ disabled }: { disabled: boolean }) => {
   const t = useTranslate()
@@ -534,12 +552,7 @@ const ExportHistory = ({ disabled }: { disabled: boolean }) => {
     setStatus(null)
     try {
       const { name, blob } = await exportHistory()
-      const url = URL.createObjectURL(blob)
-      const link = document.createElement('a')
-      link.href = url
-      link.download = name
-      link.click()
-      setTimeout(() => URL.revokeObjectURL(url), 10_000)
+      downloadBlob(name, blob)
     } catch (error) {
       setStatus(errorStatus('historyExportFailed', error))
     } finally {
@@ -565,5 +578,175 @@ const ExportHistory = ({ disabled }: { disabled: boolean }) => {
         </Button>
       }
     />
+  )
+}
+
+/** 导出最近 72 小时内更新的会话 */
+const ExportRecentHistory = ({ disabled }: { disabled: boolean }) => {
+  const t = useTranslate()
+  const empty = useChatStore(
+    (state) =>
+      !state.sessions.some(
+        (session) => session.updatedAt >= Date.now() - RECENT_HISTORY_HOURS * 60 * 60 * 1000
+      )
+  )
+  const [busy, setBusy] = useState(false)
+  const [status, setStatus] = useState<Status>(null)
+
+  const onExport = async () => {
+    setBusy(true)
+    setStatus(null)
+    try {
+      const { name, blob } = await exportHistory({ hours: RECENT_HISTORY_HOURS })
+      downloadBlob(name, blob)
+    } catch (error) {
+      setStatus(errorStatus('historyExportFailed', error))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <SettingCell
+      label={t('exportRecentLabel')}
+      description={t('exportRecentDescription')}
+      status={status}
+      action={
+        <Button
+          variant="outlined"
+          size="m"
+          className={styles.cellButton}
+          disabled={disabled || busy || empty}
+          onClick={() => void onExport()}
+        >
+          <IconDownloadOutline16 />
+          {t('exportAllDownload')}
+        </Button>
+      }
+    />
+  )
+}
+
+const useSyncHistory = () => {
+  const serverUrl = useSettings((state) => state.syncServerUrl)
+  const fileId = useSettings((state) => state.syncFileId)
+  const [busy, setBusy] = useState(false)
+  const [status, setStatus] = useState<Status>(null)
+  const syncing = useRef(false)
+  const valid = isValidSyncServerUrl(serverUrl) && isValidSyncFileId(fileId)
+
+  const run = async () => {
+    if (!valid || syncing.current) {
+      return
+    }
+    syncing.current = true
+    setBusy(true)
+    setStatus(null)
+    try {
+      const result = await syncHistory({
+        serverUrl: serverUrl.trim(),
+        fileId: fileId.trim(),
+        hours: RECENT_HISTORY_HOURS,
+      })
+      setStatus(
+        result.uploaded
+          ? {
+              key: 'syncHistoryDone',
+              params: {
+                inserted: result.imported?.inserted ?? 0,
+                updated: result.imported?.updated ?? 0,
+                kept: result.imported?.kept ?? 0,
+                exported: result.exported,
+              },
+            }
+          : { key: 'syncHistoryNothing' }
+      )
+    } catch (error) {
+      setStatus(
+        error instanceof SyncUploadError
+          ? { key: 'syncHistoryUploadFailed', params: { count: error.exported }, error: true }
+          : { key: 'syncHistoryFailed', error: true }
+      )
+    } finally {
+      syncing.current = false
+      setBusy(false)
+    }
+  }
+
+  return {
+    serverUrl,
+    fileId,
+    valid,
+    busy,
+    status,
+    run,
+    setServerUrl: setSyncServerUrl,
+    setFileId: setSyncFileId,
+  }
+}
+
+/** 同步最近 3 天对话：拉取云端并合并，再覆盖上传本地快照。 */
+const SyncHistory = ({
+  sync,
+  disabled,
+}: {
+  sync: ReturnType<typeof useSyncHistory>
+  disabled: boolean
+}) => {
+  const t = useTranslate()
+  const { status } = sync
+  const invalid = !sync.valid && (sync.serverUrl.trim() !== '' || sync.fileId.trim() !== '')
+
+  return (
+    <div className={styles.cell}>
+      <div className={styles.row}>
+        <div className={styles.text}>
+          <div className={styles.label}>{t('syncHistory')}</div>
+          <div className={clsx(styles.description, (status?.error || invalid) && styles.error)}>
+            {status
+              ? t(status.key, status.reason ? { message: t(status.reason) } : status.params)
+              : invalid
+                ? t('syncHistoryInvalidConfig')
+                : t('syncHistoryDescription')}
+          </div>
+        </div>
+        <Button
+          variant="outlined"
+          size="m"
+          className={styles.cellButton}
+          disabled={disabled || !sync.valid}
+          onClick={() => void sync.run()}
+        >
+          {sync.busy ? t('syncing') : t('syncNow')}
+        </Button>
+      </div>
+      <div className={styles.syncInputs}>
+        <label className={styles.syncField}>
+          <span>{t('syncServerUrl')}</span>
+          <input
+            type="url"
+            inputMode="url"
+            placeholder={t('syncServerUrlPlaceholder')}
+            autoComplete="off"
+            spellCheck={false}
+            value={sync.serverUrl}
+            disabled={disabled}
+            onChange={(event) => sync.setServerUrl(event.target.value)}
+          />
+        </label>
+        <label className={styles.syncField}>
+          <span>{t('syncFileId')}</span>
+          <input
+            type="text"
+            placeholder={t('syncFileIdPlaceholder')}
+            autoComplete="off"
+            spellCheck={false}
+            value={sync.fileId}
+            disabled={disabled}
+            onChange={(event) => sync.setFileId(event.target.value)}
+          />
+        </label>
+      </div>
+    </div>
   )
 }
