@@ -405,10 +405,10 @@ export const replaceHistory = async (write: () => Promise<void>): Promise<number
     sessionLoads.clear()
     await waitForIdle()
     await db.clearStaging()
-    let summaries: SessionSummary[]
+    let result: db.CommitStagingResult
     try {
       await write()
-      summaries = await db.commitStaging()
+      result = await db.commitStaging('replace')
     } catch (error) {
       await db.clearStaging().catch(db.reportStorageError('clear unfinished history replacement'))
       throw error
@@ -420,18 +420,110 @@ export const replaceHistory = async (write: () => Promise<void>): Promise<number
     set({
       ready: true,
       initError: false,
-      sessions: sortSessions(summaries),
+      sessions: sortSessions(result.inserted),
       sessionCache: {},
       sessionLoadErrors: {},
       sessionSaveErrors: {},
       activeId: null,
     })
-    return summaries.length
+    return result.inserted.length
   } finally {
     set({ importingHistory: false })
     retrySaveSessions()
     const { activeId, ready } = get()
     // 替换失败时恢复被取消的详情读取，原有记录继续可用。
+    if (activeId !== null) {
+      void ensureSessionLoaded(activeId)
+    } else if (!ready) {
+      void initChat()
+    }
+  }
+}
+
+export type MergeHistoryResult = {
+  /** 新增的会话数 */
+  inserted: number
+  /** 归档较新、覆盖本地后的会话数 */
+  updated: number
+  /** 本地较新、保留本地的归档会话数 */
+  kept: number
+}
+
+/**
+ * 合并导入历史对话：保留现有会话、附件、草稿和当前打开的会话。
+ * 同一会话 id 按 updatedAt 保留较新的版本；正在生成的会话始终以本地为准。
+ */
+export const mergeHistory = async (write: () => Promise<void>): Promise<MergeHistoryResult> => {
+  if (get().importingHistory) {
+    throw new Error('History import is already in progress')
+  }
+  // 先加载现有摘要，保证后续比较和列表合并基于完整数据。
+  await initChat()
+  set({ importingHistory: true })
+  try {
+    // 已开始的单条删除先同步到内存，避免合并后列表残留已被删除的记录。
+    await Promise.all(deletionTasks)
+    await db.clearStaging()
+    const state = get()
+    const localUpdatedAt = new Map<string, number>()
+    for (const summary of state.sessions) {
+      // 生成中的会话内容仍会增加，不能让归档版本覆盖。
+      localUpdatedAt.set(
+        summary.id,
+        Object.hasOwn(state.streaming, summary.id)
+          ? Number.POSITIVE_INFINITY
+          : summary.updatedAt
+      )
+    }
+    let result: db.CommitStagingResult
+    try {
+      await write()
+      result = await db.commitStaging('merge', localUpdatedAt)
+    } catch (error) {
+      await db.clearStaging().catch(db.reportStorageError('clear unfinished history merge'))
+      throw error
+    }
+    const updatedIds = new Set(result.updated.map((summary) => summary.id))
+    for (const id of updatedIds) {
+      // 让可能的在途读取失效，并清除将被归档版本替换的本地状态。
+      sessionLoads.delete(id)
+      sessionAccess.delete(id)
+      unsavedSessions.delete(id)
+      pendingFiles.delete(id)
+    }
+    set((current) => {
+      const summaries = new Map(current.sessions.map((summary) => [summary.id, summary]))
+      for (const summary of result.inserted) {
+        summaries.set(summary.id, summary)
+      }
+      for (const summary of result.updated) {
+        summaries.set(summary.id, summary)
+      }
+      return {
+        ready: true,
+        initError: false,
+        sessions: sortSessions([...summaries.values()]),
+        sessionCache: Object.fromEntries(
+          Object.entries(current.sessionCache).filter(([id]) => !updatedIds.has(id))
+        ),
+        sessionLoadErrors: Object.fromEntries(
+          Object.entries(current.sessionLoadErrors).filter(([id]) => !updatedIds.has(id))
+        ),
+        sessionSaveErrors: Object.fromEntries(
+          Object.entries(current.sessionSaveErrors).filter(([id]) => !updatedIds.has(id))
+        ),
+      }
+    })
+    return {
+      inserted: result.inserted.length,
+      updated: result.updated.length,
+      kept: result.kept,
+    }
+  } finally {
+    set({ importingHistory: false })
+    retrySaveSessions()
+    const { activeId, ready } = get()
+    // 被归档版本更新的当前会话需要重新读取；其他会话保持原状态。
     if (activeId !== null) {
       void ensureSessionLoaded(activeId)
     } else if (!ready) {
@@ -844,7 +936,7 @@ const prepareFiles = async (sessionId: string, request: Request, signal: AbortSi
   }
 
   const pending = new Map<string, FileAttachment>()
-  for (const [user] of getContextRounds(request.history).toReversed()) {
+  for (const [user] of [...getContextRounds(request.history)].reverse()) {
     for (const file of user.files) {
       if (!file.serverId && !serverIds.has(file.id) && !pending.has(file.id)) {
         pending.set(file.id, file)

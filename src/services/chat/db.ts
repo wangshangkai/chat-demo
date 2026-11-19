@@ -25,7 +25,7 @@ interface ChatDB extends DBSchema {
   files: { key: string; value: StoredFile }
   /**
    * 历史导入的暂存：导入过程中会话与原件只写入这两个存储，`sessions` / `files` 保持不变；
-   * 全部校验通过后在一个事务中替换正式数据并清空暂存，失败时只清空暂存。
+   * 全部校验通过后在一个事务中合并或替换正式数据并清空暂存，失败时只清空暂存。
    */
   sessionsStaging: { key: string; value: Session }
   filesStaging: { key: string; value: StoredFile }
@@ -203,45 +203,104 @@ export const updateStagingFileTypes = async (types: ReadonlyMap<string, string>)
   ])
 }
 
+export type CommitStagingMode = 'replace' | 'merge'
+
+export type CommitStagingResult = {
+  /** 新增的会话 */
+  inserted: SessionSummary[]
+  /** 归档版本较新、覆盖本地后得到的会话 */
+  updated: SessionSummary[]
+  /** 因本地版本较新而保留的归档会话数 */
+  kept: number
+}
+
 /**
- * 导入完成后用暂存替换正式数据：同一事务中替换会话、摘要和原件，并清空暂存。
- * 逐条游标复制，同一时间只读取一条记录；事务失败时整体回滚，正式数据不变。
+ * 导入完成后提交暂存，并清空暂存；事务失败时整体回滚，正式数据不变。
+ * - replace：清空并替换全部会话、摘要和原件。
+ * - merge：保留正式数据；同一会话 id 比较更新时间，归档较新才覆盖，否则保留本地。
+ * `localUpdatedAt` 提供内存中的更新时间，避免尚未落盘的本地修改被较旧的数据库记录误判。
  */
-export const commitStaging = async (): Promise<SessionSummary[]> => {
-  const summaries: SessionSummary[] = []
+export const commitStaging = async (
+  mode: CommitStagingMode = 'replace',
+  localUpdatedAt?: ReadonlyMap<string, number>
+): Promise<CommitStagingResult> => {
+  const result: CommitStagingResult = { inserted: [], updated: [], kept: 0 }
+  /** 实际采用的会话引用的文件；合并时只写入这些文件，避免保存被跳过会话的图片。 */
+  const referenced = new Set<string>()
   const tx = (await getDB()).transaction(
     ['sessions', 'sessionSummaries', 'files', 'sessionsStaging', 'filesStaging'],
     'readwrite'
   )
-  const move = async (from: 'sessionsStaging' | 'filesStaging', to: 'sessions' | 'files') => {
+  const move = async () => {
     try {
-      const target = tx.objectStore(to)
-      await target.clear()
-      if (to === 'sessions') {
-        await tx.objectStore('sessionSummaries').clear()
+      const sessions = tx.objectStore('sessions')
+      const summaries = tx.objectStore('sessionSummaries')
+      if (mode === 'replace') {
+        await sessions.clear()
+        await summaries.clear()
       }
       for (
-        let cursor = await tx.objectStore(from).openCursor();
+        let cursor = await tx.objectStore('sessionsStaging').openCursor();
         cursor;
         cursor = await cursor.continue()
       ) {
-        await target.put(cursor.value)
-        if (to === 'sessions') {
-          const summary = storedSummary(cursor.value as Session)
-          await tx.objectStore('sessionSummaries').put(summary)
-          summaries.push(toSessionSummary(summary))
+        const session = cursor.value as Session
+        const existing = mode === 'merge' ? await sessions.get(session.id) : undefined
+        const localTime = mode === 'merge' ? localUpdatedAt?.get(session.id) : undefined
+        // 内存中存在但尚未落盘的会话也视为本地版本，避免被较旧的归档覆盖或误判为新增。
+        const localExists = existing !== undefined || localTime !== undefined
+        if (localExists) {
+          const newestLocal = Math.max(
+            existing?.updatedAt ?? Number.NEGATIVE_INFINITY,
+            localTime ?? Number.NEGATIVE_INFINITY
+          )
+          if (newestLocal >= session.updatedAt) {
+            result.kept += 1
+            continue
+          }
+        }
+        const summary = storedSummary(session)
+        await sessions.put(session)
+        await summaries.put(summary)
+        const entry = toSessionSummary(summary)
+        if (localExists) {
+          result.updated.push(entry)
+        } else {
+          result.inserted.push(entry)
+        }
+        for (const id of summary.fileIds) {
+          referenced.add(id)
         }
       }
-      await tx.objectStore(from).clear()
+      await tx.objectStore('sessionsStaging').clear()
+
+      const files = tx.objectStore('files')
+      if (mode === 'replace') {
+        await files.clear()
+      }
+      for (
+        let cursor = await tx.objectStore('filesStaging').openCursor();
+        cursor;
+        cursor = await cursor.continue()
+      ) {
+        const file = cursor.value
+        if (mode === 'merge') {
+          if (!referenced.has(file.id) || (await files.getKey(file.id)) !== undefined) {
+            continue
+          }
+        }
+        await files.put(file)
+      }
+      await tx.objectStore('filesStaging').clear()
     } catch (error) {
       // 同步抛出的错误不会让事务自动回滚，需显式中止，避免只提交清空和部分移入。
       abortTransaction(tx)
       throw error
     }
   }
-  await Promise.all([move('sessionsStaging', 'sessions'), move('filesStaging', 'files'), tx.done])
-  // 直接返回本次提交的列表，调用方无需在替换成功后再发起可能失败的读取。
-  return summaries
+  await Promise.all([move(), tx.done])
+  // 直接返回本次提交的结果，调用方无需在提交成功后再发起可能失败的读取。
+  return result
 }
 
 /** 本地存储失败不打断对话，只在控制台留痕 */

@@ -76,7 +76,7 @@ export const checkArchiveFormat = async (file: File): Promise<void> => {
  * 流式导入：manifest → user（不导入）→ 全部会话 JSON → index → 全部图片。
  * 也支持会话与图片交错排列、index 位于末尾的条目顺序。
  * 会话读完立即暂存，只保留图片路径映射；图片全部读完后逐会话回填 MIME，不改变图片身份。
- * 写入导入暂存存储；调用方负责先清空暂存，成功后替换正式数据，失败时清理暂存。
+ * 写入导入暂存存储；调用方负责先清空暂存，成功后合并或替换正式数据，失败时清理暂存。
  */
 export const importArchive = async (file: File): Promise<void> => {
   if (!(await isZipFile(file))) {
